@@ -3,11 +3,28 @@ import torch.nn as nn
 import numpy as np
 import io
 import os
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Depends
 from fastapi.responses import Response
+from sqlalchemy.orm import Session
+
+# Εισαγωγή της Βάσης Δεδομένων
+from database import engine, Base, SessionLocal, PredictionRecord
+
+# 1. Δημιουργία των πινάκων στη βάση (εκτελείται κατά την εκκίνηση)
+Base.metadata.create_all(bind=engine)
+
+# Λεξικό Πετρωμάτων για την αποθήκευση στη βάση
+CLASS_NAMES = {
+    0: "Clay / Others",
+    1: "Carbonates",
+    2: "Salt",
+    3: "Sandstone",
+    4: "Shale",
+    5: "Tuff / Basement"
+}
 
 # =====================================================================
-# 1. ΤΟ ΑΡΧΙΤΕΚΤΟΝΙΚΟ ΣΧΕΔΙΟ ΤΟΥ ΜΟΝΤΕΛΟΥ (PyTorch)
+# 2. ΤΟ ΑΡΧΙΤΕΚΤΟΝΙΚΟ ΣΧΕΔΙΟ ΤΟΥ ΜΟΝΤΕΛΟΥ (PyTorch)
 # =====================================================================
 class DoubleConv(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -65,16 +82,22 @@ class AttentionUNet3D(nn.Module):
         return self.outc(x)
 
 # =====================================================================
-# 2. FASTAPI SERVER & ΦΟΡΤΩΣΗ ΤΟΥ ΕΓΚΕΦΑΛΟΥ
+# 3. FASTAPI SERVER & ΦΟΡΤΩΣΗ ΤΟΥ ΕΓΚΕΦΑΛΟΥ
 # =====================================================================
 app = FastAPI(title="Seismic AI API")
 
-print("⏳ Φόρτωση του εγκεφάλου AI στη μνήμη...")
+# Συνάρτηση (Dependency) για να ανοίγει και να κλείνει με ασφάλεια η βάση
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
+print("⏳ Φόρτωση του εγκεφάλου AI στη μνήμη...")
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = AttentionUNet3D(in_channels=1, out_channels=6).to(device)
 
-# ΕΔΩ: Το Docker ψάχνει στον νέο φάκελο model_files!
 MODEL_PATH = "model_files/SOTA_BEST_seismic_model.pth"
 
 try:
@@ -82,18 +105,18 @@ try:
     model.eval()
     print(f"✅ Το μοντέλο φορτώθηκε με επιτυχία στο {device}!")
 except Exception as e:
-    print(f"🚨 Σφάλμα φόρτωσης: Μήπως το αρχείο δεν λέγεται {MODEL_PATH}; Σφάλμα: {e}")
+    print(f"🚨 Σφάλμα φόρτωσης: {e}")
 
 # =====================================================================
-# 3. ENDPOINTS
+# 4. ENDPOINTS
 # =====================================================================
 @app.get("/")
 def home():
     return {"status": "Online", "message": "Ο AI Γεωλόγος είναι στη θέση του και περιμένει δεδομένα!"}
 
 @app.post("/predict")
-async def predict_seismic(file: UploadFile = File(...)):
-    print("📥 Λήψη νέου σεισμικού τμήματος...")
+async def predict_seismic(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    print(f"📥 Λήψη νέου σεισμικού τμήματος: {file.filename}")
     contents = await file.read()
     patch = np.load(io.BytesIO(contents))
     
@@ -103,7 +126,29 @@ async def predict_seismic(file: UploadFile = File(...)):
         output = model(patch_tensor)
         pred = torch.argmax(output, dim=1).squeeze().cpu().numpy().astype(np.uint8)
         
-    print("✅ Η πρόβλεψη ολοκληρώθηκε! Αποστολή αποτελέσματος...")
+    print("✅ Η πρόβλεψη ολοκληρώθηκε! Υπολογισμός στατιστικών...")
+    
+    # --- ΝΕΟ: Υπολογισμός και Αποθήκευση στη Βάση ---
+    # 1. Μετράμε πόσα pixels ανήκουν στο κάθε πέτρωμα
+    unique, counts = np.unique(pred, return_counts=True)
+    counts_dict = dict(zip(unique, counts))
+    
+    # 2. Βρίσκουμε το ID του πετρώματος με τον μεγαλύτερο όγκο
+    dominant_id = max(counts_dict, key=counts_dict.get) 
+    dominant_percentage = float((counts_dict[dominant_id] / pred.size) * 100)
+    
+    # 3. Εγγραφή στη βάση
+    new_record = PredictionRecord(
+        filename=file.filename,
+        dominant_rock_name=CLASS_NAMES.get(dominant_id, "Unknown"),
+        dominant_rock_percentage=dominant_percentage
+    )
+    db.add(new_record)
+    db.commit()
+    db.refresh(new_record)
+    
+    print(f"💾 Αποθηκεύτηκε στη βάση: ID=#{new_record.id} | Επικρατέστερο: {new_record.dominant_rock_name} ({new_record.dominant_rock_percentage:.2f}%)")
+    # ------------------------------------------------
     
     out_io = io.BytesIO()
     np.save(out_io, pred)
