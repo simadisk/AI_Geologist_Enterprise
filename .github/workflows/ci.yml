@@ -1,0 +1,27 @@
+name: AI Geologist CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 📥 Λήψη του Κώδικα (Checkout)
+      uses: actions/checkout@v3
+
+    - name: 🐳 Χτίσιμο και Εκκίνηση των Containers
+      # Σηκώνουμε μόνο τη βάση και το backend για το τεστ, για οικονομία πόρων
+      run: docker-compose up -d db backend
+
+    - name: ⏳ Αναμονή για Φόρτωση του AI
+      # Δίνουμε 30 δευτερόλεπτα στο PyTorch να φορτώσει το μοντέλο στη μνήμη
+      run: sleep 30
+
+    - name: ✅ Εκτέλεση των Pytest
+      # Τρέχουμε το τεστ ακριβώς όπως το έτρεξες εσύ τοπικά
+      run: docker exec geologist_backend pytest
