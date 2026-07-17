@@ -23,14 +23,11 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install flake8
-        # Εδώ ελέγχουμε αν υπάρχει requirements.txt και το κάνουμε install
-        if [ -f backend/requirements.txt ]; then pip install -r backend/requirements.txt; fi
 
     - name: 🔍 Έλεγχος Ποιότητας Κώδικα (Flake8 Linter)
       run: |
-        # Το Flake8 θα σταματήσει το build αν βρει κρίσιμα συντακτικά λάθη (π.χ. μεταβλητές που δεν ορίστηκαν)
         flake8 backend/ --count --select=E9,F63,F7,F82 --show-source --statistics
 
     - name: 🐳 Δοκιμή "Χτισίματος" του Docker Backend
       run: |
-        docker-compose build backend
+        docker compose build backend
