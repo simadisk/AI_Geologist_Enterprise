@@ -13,3 +13,4 @@ xgboost
 joblib
 holidays
 prometheus-fastapi-instrumentator
+apscheduler

@@ -5,6 +5,41 @@ from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert
 from models import WeatherRecord, EnergyRecord
 from entsoe import EntsoePandasClient
+from apscheduler.schedulers.background import BackgroundScheduler
+from database import SessionLocal
+from data_ingestor import fetch_and_store_weather, fetch_and_store_energy
+import contextlib
+
+
+
+# 1. Φτιάχνουμε μια συνάρτηση "περιτύλιγμα" που θα τρέχει στο παρασκήνιο
+def scheduled_data_ingestion():
+    print("⏳ [CRON JOB] Ξεκινάει η αυτόματη λήψη δεδομένων...")
+    
+    # Ανοίγουμε χειροκίνητα μια σύνδεση με τη βάση (αφού δεν υπάρχει χρήστης να κάνει HTTP Request)
+    db = SessionLocal()
+    try:
+        weather_res = fetch_and_store_weather(db)
+        energy_res = fetch_and_store_energy(db)
+        print(f"✅ [CRON JOB] Ολοκληρώθηκε! Νέες εγγραφές - Καιρός: {weather_res.get('new_saved')}, Ενέργεια: {energy_res.get('new_saved')}")
+    except Exception as e:
+        print(f"❌ [CRON JOB] Σφάλμα κατά την αυτόματη λήψη: {e}")
+    finally:
+        db.close()
+
+# 2. Ξεκινάμε το ρομπότ (Scheduler)
+scheduler = BackgroundScheduler()
+# Ρύθμιση για να τρέχει κάθε μέρα στις 00:05 το βράδυ (Ευρώπη/Κοπεγχάγη)
+scheduler.add_job(scheduled_data_ingestion, 'cron', hour=0, minute=5)
+scheduler.start()
+
+# Προαιρετικά: Ρυθμίζουμε τον scheduler να κλείνει ομαλά όταν σταματάμε το FastAPI
+@contextlib.asynccontextmanager
+async def lifespan(app):
+    yield
+    scheduler.shutdown()
+
+
 
 def fetch_and_store_weather(db: Session):
     # (Άφησε τον κώδικα του καιρού ακριβώς όπως τον είχαμε γράψει χθες)

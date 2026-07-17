@@ -10,9 +10,40 @@ import requests
 import holidays
 from prometheus_fastapi_instrumentator import Instrumentator
 
-app = FastAPI(title="Energy Forecasting API v2.0")
+# --- Imports για το "ξυπνητήρι" (Cron Job) ---
+from apscheduler.schedulers.background import BackgroundScheduler
+from database import SessionLocal
+from data_ingestor import fetch_and_store_weather, fetch_and_store_energy
+import contextlib
 
-# --- Prometheus Instrumentation (Μία φορά μόνο!) ---
+# 1. Η συνάρτηση που θα τρέχει στο παρασκήνιο τα μεσάνυχτα
+def scheduled_data_ingestion():
+    print("⏳ [CRON JOB] Ξεκινάει η αυτόματη λήψη δεδομένων...")
+    db = SessionLocal()
+    try:
+        weather_res = fetch_and_store_weather(db)
+        energy_res = fetch_and_store_energy(db)
+        print(f"✅ [CRON JOB] Ολοκληρώθηκε! Νέες εγγραφές - Καιρός: {weather_res.get('new_saved')}, Ενέργεια: {energy_res.get('new_saved')}")
+    except Exception as e:
+        print(f"❌ [CRON JOB] Σφάλμα κατά την αυτόματη λήψη: {e}")
+    finally:
+        db.close()
+
+# 2. Ξεκινάμε το ρομπότ (Scheduler)
+scheduler = BackgroundScheduler()
+scheduler.add_job(scheduled_data_ingestion, 'cron', hour=0, minute=5)
+scheduler.start()
+
+# 3. Ρυθμίζουμε το FastAPI να κλείνει το ρομπότ όταν κλείνουμε τον server
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    scheduler.shutdown()
+
+# 4. ΕΔΩ ΟΡΙΖΟΥΜΕ ΤΟ APP (ΜΟΝΟ ΜΙΑ ΦΟΡΑ ΜΑΖΙ ΜΕ ΤΟ LIFESPAN!)
+app = FastAPI(title="Energy Forecasting API v2.0", lifespan=lifespan)
+
+# --- Prometheus Instrumentation ---
 instrumentator = Instrumentator()
 instrumentator.instrument(app).expose(app)
 
@@ -36,7 +67,6 @@ except Exception as e:
     print(f"Σφάλμα φόρτωσης μοντέλων: {e}")
     lr_model, rf_model, xgb_model = None, None, None
 
-
 # --- Pydantic Schema για χειροκίνητα δεδομένα στο /api/predict ---
 class PredictionInput(BaseModel):
     temperature_c: float
@@ -49,8 +79,6 @@ class PredictionInput(BaseModel):
     is_holiday: int
     load_lag_24h: float
     load_lag_168h: float
-
-
 @app.get("/")
 def read_root():
     return {"status": "ML Backend v2.0 is running"}
