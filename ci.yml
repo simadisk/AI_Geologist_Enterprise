@@ -1,0 +1,29 @@
+name: CI Pipeline - Code Quality
+
+# Πότε θα τρέχει αυτός ο αυτοματισμός;
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  sonarqube:
+    name: SonarQube Code Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+      # 1. Κατεβάζει τον κώδικά σου από το repository
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Το SonarQube χρειάζεται όλο το ιστορικό
+
+      # 2. Στέλνει τον κώδικα στο δικό μας SonarQube
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}

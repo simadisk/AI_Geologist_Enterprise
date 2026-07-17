@@ -1,12 +1,13 @@
-# Models and Data
-*.pth
-*.pt
-*.npy
+# Terraform binaries and hidden folders
+.terraform/
+*.exe
+*.bat
+terraform.tfstate
+terraform.tfstate.backup
+.terraform.lock.hcl
 
-# Python Caches
-__pycache__/
-*.pyc
+# SonarQube cache
+.scannerwork/
 
-# Environment files
-venv/
-.env
+# Ignore Large Machine Learning Models
+*.joblib

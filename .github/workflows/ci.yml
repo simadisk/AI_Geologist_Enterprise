@@ -1,58 +1,36 @@
-name: AI Geologist CI/CD
+name: Backend CI Pipeline
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "master" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", "master" ]
 
 jobs:
-  # ==========================================
-  # 1. CI: Ο ΕΛΕΓΧΟΣ ΠΟΙΟΤΗΤΑΣ
-  # ==========================================
-  test:
+  build-and-check:
     runs-on: ubuntu-latest
+
     steps:
-    - name: 📥 Λήψη του Κώδικα (Checkout)
+    - name: 📥 Λήψη του κώδικα (Checkout)
       uses: actions/checkout@v3
 
-    - name: 🐳 Χτίσιμο και Εκκίνηση των Containers
-      run: docker compose up -d db backend
-
-    - name: ⏳ Αναμονή για Φόρτωση του AI
-      run: sleep 30
-
-    - name: ✅ Εκτέλεση των Pytest
-      run: docker exec geologist_backend pytest
-
-  # ==========================================
-  # 2. CD: Η ΠΑΡΑΔΟΣΗ ΣΤΟ CLOUD
-  # ==========================================
-  deploy:
-    needs: test  # ΑΥΤΟ ΕΙΝΑΙ ΤΟ ΚΛΕΙΔΙ: Προχωράει ΜΟΝΟ αν το 'test' πετύχει!
-    runs-on: ubuntu-latest
-    permissions:
-      packages: write
-      contents: read
-      
-    steps:
-    - name: 📥 Λήψη του Κώδικα
-      uses: actions/checkout@v3
-
-    - name: 🔐 Σύνδεση στην Αποθήκη του GitHub (GHCR)
-      uses: docker/login-action@v2
+    - name: 🐍 Στήσιμο Python 3.10
+      uses: actions/setup-python@v4
       with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+        python-version: '3.10'
 
-    - name: 📦 Πακετάρισμα και Ανέβασμα του Backend
+    - name: 📦 Εγκατάσταση βασικών βιβλιοθηκών
       run: |
-        # Το Docker απαιτεί το όνομα χρήστη να είναι πάντα με μικρά γράμματα
-        REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-        
-        # 1. Χτίζουμε την τελική εικόνα (image) του AI Backend
-        docker build -t ghcr.io/$REPO_OWNER/ai-geologist-backend:latest ./backend
-        
-        # 2. Στέλνουμε το έτοιμο κουτί στο Cloud!
-        docker push ghcr.io/$REPO_OWNER/ai-geologist-backend:latest
+        python -m pip install --upgrade pip
+        pip install flake8
+        # Εδώ ελέγχουμε αν υπάρχει requirements.txt και το κάνουμε install
+        if [ -f backend/requirements.txt ]; then pip install -r backend/requirements.txt; fi
+
+    - name: 🔍 Έλεγχος Ποιότητας Κώδικα (Flake8 Linter)
+      run: |
+        # Το Flake8 θα σταματήσει το build αν βρει κρίσιμα συντακτικά λάθη (π.χ. μεταβλητές που δεν ορίστηκαν)
+        flake8 backend/ --count --select=E9,F63,F7,F82 --show-source --statistics
+
+    - name: 🐳 Δοκιμή "Χτισίματος" του Docker Backend
+      run: |
+        docker-compose build backend

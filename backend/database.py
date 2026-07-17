@@ -1,31 +1,24 @@
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
 import os
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
-from sqlalchemy.orm import declarative_base
-from sqlalchemy.orm import sessionmaker
-import datetime
 
-# ΕΔΩ ΕΙΝΑΙ ΤΟ ΜΥΣΤΙΚΟ: Διαβάζουμε το URL απευθείας από το docker-compose.yml!
-# Αν δεν το βρει, βάζουμε το σωστό ως εναλλακτική.
-SQLALCHEMY_DATABASE_URL = os.getenv(
-    "DATABASE_URL", 
-    "postgresql://admin:secretpassword@db:5432/geologist_db"
-)
+# Παίρνουμε το URL της βάσης από το περιβάλλον του Docker (το ορίσαμε στο docker-compose.yml)
+# Αν δεν το βρει, βάζει ένα προεπιλεγμένο (χρήσιμο για τοπικές δοκιμές)
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://admin:secretpassword@db:5432/energy_db")
 
-# Ενεργοποίηση της μηχανής SQLAlchemy
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
+# Φτιάχνουμε τον "κινητήρα" που μιλάει στην PostgreSQL
+engine = create_engine(DATABASE_URL)
+
+# Φτιάχνουμε τη "συνεδρία" για να στέλνουμε/παίρνουμε δεδομένα
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# Αυτή είναι η βάση πάνω στην οποία θα "χτίσουμε" τους πίνακές μας
 Base = declarative_base()
 
-# =====================================================================
-# ΤΟ ΣΧΕΔΙΟ ΤΟΥ ΠΙΝΑΚΑ (Database Schema)
-# =====================================================================
-class PredictionRecord(Base):
-    __tablename__ = "predictions_history"
-
-    id = Column(Integer, primary_key=True, index=True)
-    filename = Column(String, index=True)
-    analysis_date = Column(DateTime, default=datetime.datetime.utcnow)
-    status = Column(String, default="Success")
-    
-    dominant_rock_name = Column(String)
-    dominant_rock_percentage = Column(Float)
+# Συνάρτηση που ανοίγει και κλείνει με ασφάλεια τη σύνδεση κάθε φορά που τη χρειαζόμαστε
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

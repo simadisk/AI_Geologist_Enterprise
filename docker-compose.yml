@@ -1,56 +1,66 @@
-version: '3.8'
+
 
 services:
-  # 1. Η Βάση Δεδομένων μας (PostgreSQL)
   db:
     image: postgres:15
-    container_name: geologist_db
     environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: secretpassword
-      POSTGRES_DB: geologist_db
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
-    restart: always
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - energy_net
 
-  # 2. Το Backend (FastAPI + PyTorch)
   backend:
-    build: ./backend
-    container_name: geologist_backend
+    build:
+      context: ./backend
     ports:
       - "8000:8000"
     depends_on:
       - db
     environment:
-      - DATABASE_URL=postgresql://admin:secretpassword@db:5432/geologist_db
+      DATABASE_URL: postgresql://${DB_USER}:${DB_PASSWORD}@db:5432/${DB_NAME}
+    networks:
+      - energy_net
 
-  # 3. Το Frontend (Streamlit)
   frontend:
-    build: ./frontend
-    container_name: geologist_frontend
+    build:
+      context: ./frontend
     ports:
       - "8501:8501"
     depends_on:
       - backend
-    environment:
-      - BACKEND_URL=http://backend:8000
+    networks:
+      - energy_net
 
-  # ==========================================
-  # 4. ΝΕΟ: Ο Σταθμός Παρακολούθησης (MLflow)
-  # ==========================================
-  mlflow:
-    image: python:3.10-slim
-    container_name: geologist_mlflow
+  jupyter:
+    image: jupyter/datascience-notebook:latest
     ports:
-      - "5000:5000"
-    command: bash -c "pip install mlflow && mlflow server --host 0.0.0.0 --port 5000"
+      - "8888:8888"
     volumes:
-      - mlflow_data:/mlflow
-    working_dir: /mlflow
+      - ./notebooks:/home/jovyan/work
+    depends_on:
+      - db
+    environment:
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN}
+    networks:
+      - energy_net
 
-# Αποθηκεύουμε τα δεδομένα μόνιμα στον σκληρό δίσκο
+  prometheus:
+    image: prom/prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - energy_net
+
+networks:
+  energy_net:
+    driver: bridge
+
 volumes:
-  pgdata:
-  mlflow_data:
+  postgres_data:

@@ -1,157 +1,235 @@
-import torch
-import torch.nn as nn
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from sqlalchemy import create_engine, text
+import pandas as pd
 import numpy as np
-import io
+import joblib
+from datetime import datetime, timedelta
 import os
-from fastapi import FastAPI, UploadFile, File, Depends
-from fastapi.responses import Response
-from sqlalchemy.orm import Session
+import requests
+import holidays
+from prometheus_fastapi_instrumentator import Instrumentator
 
-# Εισαγωγή της Βάσης Δεδομένων
-from database import engine, Base, SessionLocal, PredictionRecord
+app = FastAPI(title="Energy Forecasting API v2.0")
 
-# 1. Δημιουργία των πινάκων στη βάση (εκτελείται κατά την εκκίνηση)
-Base.metadata.create_all(bind=engine)
+# --- Prometheus Instrumentation (Μία φορά μόνο!) ---
+instrumentator = Instrumentator()
+instrumentator.instrument(app).expose(app)
 
-# Λεξικό Πετρωμάτων για την αποθήκευση στη βάση
-CLASS_NAMES = {
-    0: "Clay / Others",
-    1: "Carbonates",
-    2: "Salt",
-    3: "Sandstone",
-    4: "Shale",
-    5: "Tuff / Basement"
-}
+# --- Σύνδεση με τη Βάση ---
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://admin:secretpassword@db:5432/energy_db")
+engine = create_engine(DATABASE_URL)
 
-# =====================================================================
-# 2. ΤΟ ΑΡΧΙΤΕΚΤΟΝΙΚΟ ΣΧΕΔΙΟ ΤΟΥ ΜΟΝΤΕΛΟΥ (PyTorch)
-# =====================================================================
-class DoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm3d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm3d(out_channels),
-            nn.ReLU(inplace=True)
-        )
-    def forward(self, x): 
-        return self.conv(x)
+# --- Ημερολόγιο Δανίας ---
+dk_holidays = holidays.DK()
 
-class AttentionBlock3D(nn.Module):
-    def __init__(self, F_g, F_l, F_int):
-        super().__init__()
-        self.W_g = nn.Sequential(nn.Conv3d(F_g, F_int, kernel_size=1), nn.BatchNorm3d(F_int))
-        self.W_x = nn.Sequential(nn.Conv3d(F_l, F_int, kernel_size=1), nn.BatchNorm3d(F_int))
-        self.psi = nn.Sequential(nn.Conv3d(F_int, 1, kernel_size=1), nn.BatchNorm3d(1), nn.Sigmoid())
-        self.relu = nn.ReLU(inplace=True)
-    def forward(self, g, x):
-        return x * self.psi(self.relu(self.W_g(g) + self.W_x(x)))
-
-class AttentionUNet3D(nn.Module):
-    def __init__(self, in_channels=1, out_channels=6):
-        super().__init__()
-        self.down1 = DoubleConv(in_channels, 16); self.pool1 = nn.MaxPool3d(2)
-        self.down2 = DoubleConv(16, 32); self.pool2 = nn.MaxPool3d(2)
-        self.down3 = DoubleConv(32, 64); self.pool3 = nn.MaxPool3d(2)
-        self.bottleneck = DoubleConv(64, 128)
-
-        self.upconv3 = nn.ConvTranspose3d(128, 64, kernel_size=2, stride=2)
-        self.att3 = AttentionBlock3D(64, 64, 32); self.up3 = DoubleConv(128, 64)
-
-        self.upconv2 = nn.ConvTranspose3d(64, 32, kernel_size=2, stride=2)
-        self.att2 = AttentionBlock3D(32, 32, 16); self.up2 = DoubleConv(64, 32)
-
-        self.upconv1 = nn.ConvTranspose3d(32, 16, kernel_size=2, stride=2)
-        self.att1 = AttentionBlock3D(16, 16, 8); self.up1 = DoubleConv(32, 16)
-
-        self.outc = nn.Conv3d(16, out_channels, kernel_size=1)
-
-    def forward(self, x):
-        x1 = self.down1(x)
-        x2 = self.down2(self.pool1(x1))
-        x3 = self.down3(self.pool2(x2))
-        x4 = self.bottleneck(self.pool3(x3))
-
-        g3 = self.upconv3(x4); x = self.up3(torch.cat([g3, self.att3(g3, x3)], dim=1))
-        g2 = self.upconv2(x);  x = self.up2(torch.cat([g2, self.att2(g2, x2)], dim=1))
-        g1 = self.upconv1(x);  x = self.up1(torch.cat([g1, self.att1(g1, x1)], dim=1))
-        
-        return self.outc(x)
-
-# =====================================================================
-# 3. FASTAPI SERVER & ΦΟΡΤΩΣΗ ΤΟΥ ΕΓΚΕΦΑΛΟΥ
-# =====================================================================
-app = FastAPI(title="Seismic AI API")
-
-# Συνάρτηση (Dependency) για να ανοίγει και να κλείνει με ασφάλεια η βάση
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-print("⏳ Φόρτωση του εγκεφάλου AI στη μνήμη...")
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = AttentionUNet3D(in_channels=1, out_channels=6).to(device)
-
-MODEL_PATH = "model_files/SOTA_BEST_seismic_model.pth"
+# --- Φόρτωση των Μοντέλων από τον φάκελο "model_files" ---
+MODEL_DIR = os.path.join(os.path.dirname(__file__), "model_files")
 
 try:
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-    model.eval()
-    print(f"✅ Το μοντέλο φορτώθηκε με επιτυχία στο {device}!")
+    print("Φόρτωση ΝΕΩΝ Μοντέλων ML v2.0...")
+    lr_model = joblib.load(os.path.join(MODEL_DIR, "final_linear_regression.joblib"))
+    rf_model = joblib.load(os.path.join(MODEL_DIR, "final_random_forest.joblib"))
+    xgb_model = joblib.load(os.path.join(MODEL_DIR, "final_xgboost.joblib"))
+    print("Τα μοντέλα φορτώθηκαν επιτυχώς!")
 except Exception as e:
-    print(f"🚨 Σφάλμα φόρτωσης: {e}")
+    print(f"Σφάλμα φόρτωσης μοντέλων: {e}")
+    lr_model, rf_model, xgb_model = None, None, None
 
-# =====================================================================
-# 4. ENDPOINTS
-# =====================================================================
+
+# --- Pydantic Schema για χειροκίνητα δεδομένα στο /api/predict ---
+class PredictionInput(BaseModel):
+    temperature_c: float
+    apparent_temp_c: float
+    wind_speed_kmh: float
+    solar_radiation: float
+    hour: int
+    month: int
+    day_of_week: int
+    is_holiday: int
+    load_lag_24h: float
+    load_lag_168h: float
+
+
 @app.get("/")
-def home():
-    return {"status": "Online", "message": "Ο AI Γεωλόγος είναι στη θέση του και περιμένει δεδομένα!"}
+def read_root():
+    return {"status": "ML Backend v2.0 is running"}
 
-@app.post("/predict")
-async def predict_seismic(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    print(f"📥 Λήψη νέου σεισμικού τμήματος: {file.filename}")
-    contents = await file.read()
-    patch = np.load(io.BytesIO(contents))
-    
-    patch_tensor = torch.from_numpy(patch).float().unsqueeze(0).unsqueeze(0).to(device)
-    
-    with torch.no_grad():
-        output = model(patch_tensor)
-        pred = torch.argmax(output, dim=1).squeeze().cpu().numpy().astype(np.uint8)
+@app.post("/api/predict")
+def predict_single(data: PredictionInput):
+    """ΝΕΟ ENDPOINT: Δέχεται χειροκίνητα δεδομένα και επιστρέφει άμεση πρόβλεψη"""
+    if not xgb_model:
+        raise HTTPException(status_code=500, detail="Το μοντέλο XGBoost δεν έχει φορτωθεί.")
         
-    print("✅ Η πρόβλεψη ολοκληρώθηκε! Υπολογισμός στατιστικών...")
+    # Μετατροπή των ωρών/μηνών σε κυκλικά features
+    hour_sin = np.sin(2 * np.pi * data.hour / 24)
+    hour_cos = np.cos(2 * np.pi * data.hour / 24)
+    month_sin = np.sin(2 * np.pi * data.month / 12)
+    month_cos = np.cos(2 * np.pi * data.month / 12)
+    is_weekend = 1 if data.day_of_week >= 5 else 0
     
-    # --- ΝΕΟ: Υπολογισμός και Αποθήκευση στη Βάση ---
-    # 1. Μετράμε πόσα pixels ανήκουν στο κάθε πέτρωμα
-    unique, counts = np.unique(pred, return_counts=True)
-    counts_dict = dict(zip(unique, counts))
+    # Δημιουργία DataFrame με τη σειρά που εκπαιδεύτηκε το μοντέλο
+    df_input = pd.DataFrame([{
+        'temperature_c': data.temperature_c,
+        'apparent_temp_c': data.apparent_temp_c,
+        'wind_speed_kmh': data.wind_speed_kmh,
+        'solar_radiation': data.solar_radiation,
+        'hour_sin': hour_sin,
+        'hour_cos': hour_cos,
+        'month_sin': month_sin,
+        'month_cos': month_cos,
+        'is_weekend': is_weekend,
+        'is_holiday': data.is_holiday,
+        'load_lag_24h': data.load_lag_24h,
+        'load_lag_168h': data.load_lag_168h
+    }])
     
-    # 2. Βρίσκουμε το ID του πετρώματος με τον μεγαλύτερο όγκο
-    dominant_id = max(counts_dict, key=counts_dict.get) 
-    dominant_percentage = float((counts_dict[dominant_id] / pred.size) * 100)
+    # Ζωντανή Πρόβλεψη
+    pred_xgb = xgb_model.predict(df_input)[0]
     
-    # 3. Εγγραφή στη βάση
-    new_record = PredictionRecord(
-        filename=file.filename,
-        dominant_rock_name=CLASS_NAMES.get(dominant_id, "Unknown"),
-        dominant_rock_percentage=dominant_percentage
-    )
-    db.add(new_record)
-    db.commit()
-    db.refresh(new_record)
-    
-    print(f"💾 Αποθηκεύτηκε στη βάση: ID=#{new_record.id} | Επικρατέστερο: {new_record.dominant_rock_name} ({new_record.dominant_rock_percentage:.2f}%)")
-    # ------------------------------------------------
-    
-    out_io = io.BytesIO()
-    np.save(out_io, pred)
-    out_io.seek(0)
-    
-    return Response(content=out_io.read(), media_type="application/octet-stream")
+    return {
+        "prediction_mw": float(pred_xgb),
+        "model_used": "XGBoost Tuned"
+    }
+
+@app.get("/api/forecast")
+def get_forecast(start_date: str, end_date: str):
+    """ΙΣΤΟΡΙΚΗ ΠΡΟΒΛΕΨΗ (BACKTESTING) - V2.0"""
+    if not all([lr_model, rf_model, xgb_model]):
+        raise HTTPException(status_code=500, detail="Τα μοντέλα δεν έχουν φορτωθεί.")
+
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        fetch_start = start_dt - timedelta(days=7)
+        
+        # 1. Φορτίο από τη Βάση
+        query = text("""
+            SELECT datetime, load_mw FROM energy_history
+            WHERE datetime >= :start AND datetime <= :end ORDER BY datetime ASC
+        """)
+        with engine.connect() as conn:
+            df_load = pd.read_sql(query, conn, params={"start": fetch_start, "end": end_dt})
+        
+        if df_load.empty:
+            return {"error": "Δεν βρέθηκαν ιστορικά δεδομένα φορτίου για αυτή την περίοδο."}
+        df_load.set_index('datetime', inplace=True)
+        
+        # 2. Καιρός V2.0 από το Archive API
+        weather_url = f"https://archive-api.open-meteo.com/v1/archive?latitude=55.6761&longitude=12.5683&start_date={fetch_start.strftime('%Y-%m-%d')}&end_date={end_dt.strftime('%Y-%m-%d')}&hourly=temperature_2m,apparent_temperature,wind_speed_10m,shortwave_radiation"
+        res = requests.get(weather_url).json()
+        
+        if "error" in res:
+             return {"error": "Αδυναμία άντλησης ιστορικού καιρού από το Open-Meteo."}
+             
+        df_weather = pd.DataFrame({
+            'datetime': pd.to_datetime(res['hourly']['time']),
+            'temperature_c': res['hourly']['temperature_2m'],
+            'apparent_temp_c': res['hourly']['apparent_temperature'],
+            'wind_speed_kmh': res['hourly']['wind_speed_10m'],
+            'solar_radiation': res['hourly']['shortwave_radiation']
+        })
+        df_weather.set_index('datetime', inplace=True)
+        
+        # 3. Ένωση και Feature Engineering
+        df = df_load.join(df_weather, how='inner')
+        df['load_lag_24h'] = df['load_mw'].shift(24)
+        df['load_lag_168h'] = df['load_mw'].shift(168)
+        
+        df_target = df.loc[start_date:end_date].copy()
+        df_target.dropna(inplace=True)
+        
+        if df_target.empty:
+            return {"error": "Δεν επαρκούν τα δεδομένα (Lags) για πρόβλεψη."}
+
+        # Κυκλικός Χρόνος & Ημερολόγιο
+        df_target['hour'] = df_target.index.hour
+        df_target['month'] = df_target.index.month
+        df_target['hour_sin'] = np.sin(2 * np.pi * df_target['hour'] / 24)
+        df_target['hour_cos'] = np.cos(2 * np.pi * df_target['hour'] / 24)
+        df_target['month_sin'] = np.sin(2 * np.pi * df_target['month'] / 12)
+        df_target['month_cos'] = np.cos(2 * np.pi * df_target['month'] / 12)
+        df_target['is_weekend'] = df_target.index.dayofweek.map(lambda x: 1 if x >= 5 else 0)
+        df_target['is_holiday'] = df_target.index.map(lambda x: 1 if x.date() in dk_holidays else 0)
+
+        # 4. Πρόβλεψη
+        features = ['temperature_c', 'apparent_temp_c', 'wind_speed_kmh', 'solar_radiation', 'hour_sin', 'hour_cos', 'month_sin', 'month_cos', 'is_weekend', 'is_holiday', 'load_lag_24h', 'load_lag_168h']
+        X = df_target[features]
+        
+        df_target['pred_lr'] = lr_model.predict(X)
+        df_target['pred_rf'] = rf_model.predict(X)
+        df_target['pred_xgb'] = xgb_model.predict(X)
+        df_target['pred_ensemble'] = (df_target['pred_lr'] + df_target['pred_rf'] + df_target['pred_xgb']) / 3
+        
+        df_target.reset_index(inplace=True)
+        return df_target.to_dict(orient="records")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+        
+@app.get("/api/live_forecast")
+def live_forecast(start_date: str, end_date: str):
+    """LIVE ΠΡΟΒΛΕΨΗ ΜΕΛΛΟΝΤΟΣ - V2.0"""
+    try:
+        # 1. Καιρός V2.0 από το Forecast API
+        url = f"https://api.open-meteo.com/v1/forecast?latitude=55.6761&longitude=12.5683&hourly=temperature_2m,apparent_temperature,wind_speed_10m,shortwave_radiation&start_date={start_date}&end_date={end_date}"
+        weather_res = requests.get(url).json()
+        
+        if "error" in weather_res:
+            return {"error": "Αδυναμία άντλησης καιρού από το Open-Meteo."}
+            
+        times = weather_res['hourly']['time']
+        temps = weather_res['hourly']['temperature_2m']
+        apparent_temps = weather_res['hourly']['apparent_temperature']
+        winds = weather_res['hourly']['wind_speed_10m']
+        radiations = weather_res['hourly']['shortwave_radiation']
+        
+        # 2. Lags από τη Βάση
+        query = text("SELECT load_mw FROM energy_history ORDER BY datetime DESC LIMIT 168;")
+        with engine.connect() as conn:
+            recent_loads = [row[0] for row in conn.execute(query).fetchall()]
+            recent_loads.reverse()
+            
+        results = []
+        for i in range(len(times)):
+            dt = datetime.fromisoformat(times[i])
+            
+            # Υπολογισμός Lags
+            lag_24_index = -(24 - (i % 24))
+            lag_24 = recent_loads[lag_24_index] if abs(lag_24_index) <= len(recent_loads) else recent_loads[-1]
+            lag_168 = recent_loads[i % 168] if i < 168 else recent_loads[-1]
+            
+            # Δημιουργία των 12 Features
+            X_live = pd.DataFrame([{
+                'temperature_c': temps[i], 
+                'apparent_temp_c': apparent_temps[i], 
+                'wind_speed_kmh': winds[i], 
+                'solar_radiation': radiations[i],
+                'hour_sin': np.sin(2 * np.pi * dt.hour / 24), 
+                'hour_cos': np.cos(2 * np.pi * dt.hour / 24), 
+                'month_sin': np.sin(2 * np.pi * dt.month / 12), 
+                'month_cos': np.cos(2 * np.pi * dt.month / 12),
+                'is_weekend': 1 if dt.weekday() >= 5 else 0, 
+                'is_holiday': 1 if dt.date() in dk_holidays else 0, 
+                'load_lag_24h': lag_24, 
+                'load_lag_168h': lag_168
+            }])
+            
+            # Πρόβλεψη V2.0
+            pred_lr = lr_model.predict(X_live)[0]
+            pred_rf = rf_model.predict(X_live)[0]
+            pred_xgb = xgb_model.predict(X_live)[0]
+            pred_ensemble = (pred_lr + pred_rf + pred_xgb) / 3
+            
+            results.append({
+                "datetime": dt.isoformat(),
+                "temperature_c": temps[i],
+                "apparent_temp_c": apparent_temps[i], 
+                "wind_speed_kmh": winds[i],
+                "solar_radiation": radiations[i],     
+                "pred_ensemble": pred_ensemble
+            })
+            
+        return results
+    except Exception as e:
+        return {"error": str(e)}
