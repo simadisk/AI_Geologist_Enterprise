@@ -48,7 +48,10 @@ instrumentator = Instrumentator()
 instrumentator.instrument(app).expose(app)
 
 # --- Σύνδεση με τη Βάση ---
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://admin:secretpassword@db:5432/energy_db")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("❌ Σφάλμα: Το DATABASE_URL δεν βρέθηκε! Ελέγξτε το αρχείο .env")
+    
 engine = create_engine(DATABASE_URL)
 
 # --- Ημερολόγιο Δανίας ---

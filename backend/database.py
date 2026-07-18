@@ -4,8 +4,11 @@ import os
 
 # Παίρνουμε το URL της βάσης από το περιβάλλον του Docker (το ορίσαμε στο docker-compose.yml)
 # Αν δεν το βρει, βάζει ένα προεπιλεγμένο (χρήσιμο για τοπικές δοκιμές)
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://admin:secretpassword@db:5432/energy_db")
-
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("❌ Σφάλμα: Το DATABASE_URL δεν βρέθηκε! Ελέγξτε το αρχείο .env")
+    
+    
 # Φτιάχνουμε τον "κινητήρα" που μιλάει στην PostgreSQL
 engine = create_engine(DATABASE_URL)
 
